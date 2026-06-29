@@ -1,0 +1,12 @@
+# Exécuter Tor avec un utilisateur non-root par sécurité
+User tor
+
+# Forcer le dossier de travail en dehors de /root
+DataDirectory /var/lib/tor
+
+# Emplacement du service caché
+HiddenServiceDir /var/lib/tor/hidden_service/
+
+# Redirection du trafic Tor vers les services locaux (Loopback)
+HiddenServicePort 80 127.0.0.1:80
+HiddenServicePort 4242 127.0.0.1:4242

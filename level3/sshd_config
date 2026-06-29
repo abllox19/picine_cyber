@@ -1,0 +1,13 @@
+# Port demandé par le sujet
+Port 4242
+
+# Restreindre l'écoute à la boucle locale
+ListenAddress 127.0.0.1
+
+# Autoriser la connexion root (pour les besoins du test)
+PermitRootLogin yes
+PasswordAuthentication yes
+
+# Désactiver les fonctionnalités inutiles pour ce scope
+X11Forwarding no
+AllowTcpForwarding no

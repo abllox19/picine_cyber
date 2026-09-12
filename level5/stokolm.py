@@ -103,6 +103,10 @@ def main():
 
     infection_dir = Path.home() / "infection"
 
+    if not infection_dir.exists() or not infection_dir.is_dir():
+        print(f"Erreur : Le dossier {infection_dir} n'existe pas.", file=sys.stderr)
+        sys.exit(1)
+
     if args.reverse:
         # Mode Déchiffrement
         try:
@@ -116,7 +120,7 @@ def main():
         decrypt_files(target_files, cipher, args.silent)
 
     else:
-        # Mode Chiffrement
+        # Mode Chiffrement  
         key = Fernet.generate_key()
         cipher = Fernet(key)
 

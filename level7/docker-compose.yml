@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  server:
+    build: ./server
+    container_name: ftpserver
+    hostname: ftpserver
+    networks:
+      inq-net:
+        ipv4_address: 172.20.0.10
+        mac_address: 02:42:ac:14:00:0a
+
+  client:
+    image: alpine:3.19
+    container_name: ftpclient
+    hostname: ftpclient
+    command: tail -f /dev/null
+    networks:
+      inq-net:
+        ipv4_address: 172.20.0.20
+        mac_address: 02:42:ac:14:00:14
+    init: true
+
+  inquisitor:
+    build: ./docker_inquisitor
+    container_name: inquisitor
+    hostname: inquisitor
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - ./:/app
+    networks:
+      inq-net:
+        ipv4_address: 172.20.0.30
+        mac_address: 02:42:ac:14:00:1e
+    init: true
+
+networks:
+  inq-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/24

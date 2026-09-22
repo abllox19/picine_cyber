@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+import os
+import re
+import sys
+import argparse
+import requests
+from typing import Optional
+from datetime import datetime
+from urllib.parse import urlparse, parse_qs, urlunsplit
+
+
+class NetworkClient:
+    def __init__(self, target_url: str, method: str = "GET", headers: dict = None, cookies: dict = None):
+        self.method = method.upper()
+        self.parsed = urlparse(target_url)
+        # Base de l'URL sans la query string
+        self.endpoint = urlunsplit((self.parsed.scheme, self.parsed.netloc, self.parsed.path, "", ""))
+        # Dictionnaire des paramètres initiaux
+        self.base_params = {k: v[0] for k, v in parse_qs(self.parsed.query).items()}
+        
+        self.session = requests.Session()
+        if headers:
+            self.session.headers.update(headers)
+        if cookies:
+            self.session.cookies.update(cookies)
+
+    def send(self, custom_params: dict) -> requests.Response:
+        """
+        Envoie la requête selon la méthode configurée (GET ou POST).
+        """
+        if self.method == "POST":
+            # En POST, les paramètres sont envoyés dans le corps (data)
+            return self.session.post(self.endpoint, data=custom_params)
+        else:
+            # En GET, les paramètres restent dans l'URL (query string)
+            return self.session.get(self.endpoint, params=custom_params)
+
+class ResponseAnalyzer:
+    # Signatures d'erreurs textuelles standard renvoyées par les moteurs
+    DBMS_ERRORS = {
+        "MySQL": [
+            re.compile(r"you have an error in your sql syntax", re.IGNORECASE),
+            re.compile(r"warning: mysql_", re.IGNORECASE),
+            re.compile(r"check the manual that corresponds to your mysql server version", re.IGNORECASE),
+            re.compile(r"unclosed quotation mark after the character string", re.IGNORECASE),
+        ],
+        "SQLite": [
+            re.compile(r"sqlite3::query\(", re.IGNORECASE),
+            re.compile(r"unrecognized token:", re.IGNORECASE),
+            re.compile(r"sqlite_error", re.IGNORECASE),
+            re.compile(r"near \".*\": syntax error", re.IGNORECASE),
+        ]
+    }
+
+    def __init__(self, baseline_response: requests.Response):
+        """
+        Conserve la réponse de référence saine pour les comparaisons futures.
+        """
+        self.baseline_status = baseline_response.status_code
+        self.baseline_length = len(baseline_response.text)
+        self.baseline_text = baseline_response.text
+
+    def detect_dbms_error(self, response: requests.Response) -> Optional[str]:
+        """
+        Recherche la présence de signatures d'erreur explicites dans le corps de la réponse.
+        Retourne le nom du SGBD identifié ou None.
+        """
+        body = response.text
+        for dbms, patterns in self.DBMS_ERRORS.items():
+            for pattern in patterns:
+                if pattern.search(body):
+                    return dbms
+        return None
+
+    def is_content_different(self, response: requests.Response, threshold: int = 50) -> bool:
+        """
+        Vérifie si la réponse s'écarte significativement de la réponse de référence.
+        Utilise le code HTTP ou un écart sur la longueur du contenu (en octets).
+        """
+        if response.status_code != self.baseline_status:
+            return True
+
+        length_diff = abs(len(response.text) - self.baseline_length)
+        return length_diff > threshold
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Vaccine - Outil de détection et d'audit SQLi",
+        usage="./vaccine [-o OUTPUT] [-X METHOD] [-c COOKIE] URL"
+    )
+    parser.add_argument("-o", "--output", default="vaccine_report.txt", help="Fichier de rapport")
+    parser.add_argument("-X", "--method", default="GET", choices=["GET", "POST"], help="Méthode HTTP (GET/POST)")
+    parser.add_argument("-c", "--cookie", default=None, help="Cookies HTTP (ex: 'PHPSESSID=1234; security=low')")
+    parser.add_argument("url", help="URL cible à tester")
+
+    return parser.parse_args()
+
+def parse_cookies(cookie_str: Optional[str]) -> dict:
+    cookies = {}
+    if not cookie_str:
+        return cookies
+    for item in cookie_str.split(";"):
+        if "=" in item:
+            key, val = item.split("=", 1)
+            cookies[key.strip()] = val.strip()
+    return cookies
+
+def scan_target(client: NetworkClient, analyzer: ResponseAnalyzer):
+    vulnerabilities = []
+    
+    # Échantillons de tests pour provoquer des erreurs de syntaxe
+    error_probes = ["'", "\"", "')"]
+
+    for param in client.base_params.keys():
+        # On évite d'altérer les boutons de soumission
+        if param.lower() == "submit":
+            continue
+
+        print(f"\n[*] Test du paramètre : '{param}'...")
+
+        # 1. Test Error-based
+        for probe in error_probes:
+            test_params = client.base_params.copy()
+            test_params[param] = probe
+            
+            resp = client.send(test_params)
+            dbms = analyzer.detect_dbms_error(resp)
+            if dbms:
+                print(f"[+] [VULNÉRABLE] Error-based détectée sur '{param}' !")
+                print(f"[+] SGBD identifié : {dbms}")
+                print(f"[+] Payload déclencheur : {probe}")
+                vulnerabilities.append({
+                    "param": param,
+                    "type": "Error-based",
+                    "dbms": dbms,
+                    "payload": probe
+                })
+                break
+
+    return vulnerabilities
+
+def save_report(output_file: str, target_url: str, method: str, vulnerabilities: list):
+    """
+    Enregistre les résultats de l'analyse dans le fichier spécifié par l'option -o.
+    Crée le fichier s'il n'existe pas, ou ajoute les résultats à la suite.
+    """
+    try:
+        with open(output_file, "a", encoding="utf-8") as f:
+            f.write("=" * 60 + "\n")
+            f.write(f"Rapport Vaccine - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Cible       : {target_url}\n")
+            f.write(f"Méthode HTTP: {method}\n")
+            f.write("=" * 60 + "\n\n")
+
+            if not vulnerabilities:
+                f.write("Aucune anomalie détectée sur les paramètres analysés.\n\n")
+                return
+
+            for vuln in vulnerabilities:
+                f.write(f"Paramètre vulnérable : {vuln.get('param')}\n")
+                f.write(f"Type de détection    : {vuln.get('type')}\n")
+                f.write(f"Moteur SGBD présumé  : {vuln.get('dbms')}\n")
+                f.write(f"Indicateur / Vecteur : {vuln.get('payload')}\n")
+                f.write("-" * 40 + "\n")
+            f.write("\n")
+        
+        print(f"[+] Rapport sauvegardé avec succès dans : {output_file}")
+    except OSError as e:
+        print(f"[-] Erreur lors de l'écriture du rapport : {e}", file=sys.stderr)
+
+def main():
+    args = parse_arguments()
+    cookies = parse_cookies(args.cookie)
+
+    client = NetworkClient(args.url, method=args.method, cookies=cookies)
+
+    if not client.base_params:
+        print("[-] Erreur : Aucun paramètre détecté dans l'URL.")
+        sys.exit(1)
+
+    print(f"[*] URL cible    : {client.endpoint}")
+    print(f"[*] Méthode      : {client.method}")
+    print(f"[*] Paramètres   : {list(client.base_params.keys())}")
+    print("[*] Envoi de la requête de référence...")
+
+    baseline_resp = client.send(client.base_params)
+
+    # Avertissement si redirection vers la mire de login sans bloquer d'autres sites
+    if "login.php" in baseline_resp.url or "Login :: Damn Vulnerable Web App" in baseline_resp.text:
+        print("[-] Avertissement : Redirection vers le login détectée. Fournis un cookie valide via -c.")
+        sys.exit(1)
+
+    print(f"[+] Succès ! Réponse HTTP : {baseline_resp.status_code}")
+    print(f"[+] Taille de la page : {len(baseline_resp.text)} octets")
+
+    analyzer = ResponseAnalyzer(baseline_resp)
+    print("[+] Analyseur initialisé.")
+
+    results = scan_target(client, analyzer)
+    
+    if results:
+        print(f"\n[+] Scan terminé : {len(results)} paramètre(s) vulnérable(s) identifié(s).")
+    else:
+        print("\n[-] Aucune vulnérabilité directe détectée avec ces signatures.")
+
+    save_report(args.output, client.endpoint, client.method, results)
+
+if __name__ == "__main__":
+    main()

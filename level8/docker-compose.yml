@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  dvwa:
+    image: docker.io/vulnerables/web-dvwa:latest
+    container_name: vaccine_dvwa
+    ports:
+      - "8080:80"
+    restart: unless-stopped
